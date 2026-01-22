@@ -1,60 +1,39 @@
 import torch
+import torch.optim as optim
 import os
-import argparse
-from datetime import datetime
-from transformers import AutoTokenizer
+import json
+from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
 
 from config import CTMConfig
-from model import ContinuousThoughtMachine
-from loss import CTMLoss # Using the dynamic loss provided
+from ctm_model import ContinuousThoughtMachine
+from loss import CTMLoss
 
-def get_lr(optimizer):
-    for param_group in optimizer.param_groups:
-        return param_group['lr']
+# --- Config ---
+TRAIN_PATH = "data/train_embeddings.jsonl"
+VAL_PATH = "data/val_embeddings.jsonl"
+CHECKPOINT_DIR = "checkpoints"
+LR = 1e-4
+EPOCHS = 13
+BATCH_SIZE = 4 # CTM ist klein, Batch Size > 1 ist okay, wenn Sequence Length gepadded wird (hier einfachheitshalber Batch=1 oder wir nutzen Collate)
 
-def train_epoch(model, loader, optimizer, scheduler, loss_fn, device, epoch):
-    model.train()
-    total_loss = 0
-    correct = 0
-    total = 0
-    
-    for batch in loader:
-        input_ids = batch['input_ids'].to(device)
-        mask = batch['attention_mask'].to(device)
-        labels = batch['label'].to(device).float()
-        
-        # Ensure labels are 1D: [B]
-        if labels.dim() > 1:
-            labels = labels.squeeze()
-        
-        optimizer.zero_grad()
-        
-        # Forward pass
-        outputs = model(input_ids, attention_mask=mask)
-        
-        # Calculate Loss
-        loss = loss_fn(
-            outputs['predictions'], 
-            outputs['certainties'], 
-            labels
-        )
-        
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        
-        total_loss += loss.item()
-        
-        # Calculate Accuracy (using the adaptive final prediction)
-        final_pred = outputs['final_prediction'].squeeze()  # Ensure [B]
-        preds = (final_pred > 0.5).float()
-        correct += (preds == labels).sum().item()
-        total += labels.shape[0]
-        
-    if scheduler:
-        scheduler.step()
-        
-    return total_loss / len(loader), correct / total
+# --- Dataset ---
+class CTMDataset(Dataset):
+    def __init__(self, path):
+        self.data = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                self.data.append(json.loads(line))
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        return {
+            "embeddings": torch.tensor(item['embeddings'], dtype=torch.float32),
+            "label": torch.tensor(item['label'], dtype=torch.float)
+        }
 
 def evaluate(model, loader, loss_fn, device):
     model.eval()
@@ -64,104 +43,72 @@ def evaluate(model, loader, loss_fn, device):
     
     with torch.no_grad():
         for batch in loader:
-            input_ids = batch['input_ids'].to(device)
-            mask = batch['attention_mask'].to(device)
-            labels = batch['label'].to(device).float()
+            emb = batch['embeddings'].to(device)
+            label = batch['label'].to(device)
+            out = model(emb)
             
-            # Ensure labels are 1D: [B]
-            if labels.dim() > 1:
-                labels = labels.squeeze()
-            
-            outputs = model(input_ids, attention_mask=mask)
-            loss = loss_fn(
-                outputs['predictions'], 
-                outputs['certainties'], 
-                labels
-            )
-            
+            loss = loss_fn(out['all_logits'], out['certainties'], label)
             total_loss += loss.item()
             
-            final_pred = outputs['final_prediction'].squeeze()  # Ensure [B]
-            preds = (final_pred > 0.5).float()
-            correct += (preds == labels).sum().item()
-            total += labels.shape[0]
+            # Accuracy am besten Punkt
+            pred = (out['probs'] > 0.5).float()
+            correct += (pred == label).sum().item()
+            total += label.size(0)
             
     return total_loss / len(loader), correct / total
 
-def main(args):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
-    
-    # 1. Config
-    config = CTMConfig(
-        D=args.D,
-        M=args.M,
-        T_max=args.T_max,
-        tokenizer_name=args.tokenizer,
-        max_context_len=args.max_tokens,
-        d_embed=args.d_embed,
-        num_heads=args.num_heads
-    )
-    
-    # 2. Load Tokenizer to get vocab size
-    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
-    vocab_size = tokenizer.vocab_size
-    
-    # 3. Model
-    model = ContinuousThoughtMachine(config, vocab_size=vocab_size).to(device)
-    print(f"Model Params: {sum(p.numel() for p in model.parameters()):,}")
-    
-    # 4. Data
-    from data_loader import create_data_loaders
-    train_loader, val_loader = create_data_loaders(
-        args.data_path, config, batch_size=args.batch_size
-    )
-    
-    # 5. Loss & Optimizer
-    loss_fn = CTMLoss(num_classes=1, auxiliary_weight=0.1)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    
-    # Scheduler (Cosine with warmup)
-    num_steps = len(train_loader) * args.epochs
-    warmup_steps = int(0.1 * num_steps)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=lambda step: min(1.0, step / warmup_steps) if step < warmup_steps else 0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / (num_steps - warmup_steps)))
-    )
+def main():
+    if not os.path.exists(TRAIN_PATH):
+        print("Bitte erst preprocess_embeddings.py ausführen!")
+        return
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Training auf {device}")
+
+    # Load Data (Batch Size 1 umgeht Padding-Probleme bei variabler Chat-Länge)
+    train_loader = DataLoader(CTMDataset(TRAIN_PATH), batch_size=1, shuffle=True)
+    val_loader = DataLoader(CTMDataset(VAL_PATH), batch_size=1, shuffle=False)
     
-    best_acc = 0.0
-    for epoch in range(args.epochs):
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, scheduler, loss_fn, device, epoch)
+    # Model Setup
+    config = CTMConfig()
+    model = ContinuousThoughtMachine(config).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=LR)
+    loss_fn = CTMLoss()
+    
+    best_val_loss = float('inf')
+    
+    print("Starte Training...")
+    
+    for epoch in range(EPOCHS):
+        model.train()
+        train_loss = 0
+        
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        for batch in pbar:
+            emb = batch['embeddings'].to(device)
+            label = batch['label'].to(device)
+            
+            optimizer.zero_grad()
+            out = model(emb)
+            loss = loss_fn(out['all_logits'], out['certainties'], label)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+            
+        avg_train_loss = train_loss / len(train_loader)
+        
+        # Validation
         val_loss, val_acc = evaluate(model, val_loader, loss_fn, device)
+        print(f"-> Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:.1f}%")
         
-        print(f"Epoch {epoch+1}/{args.epochs}")
-        print(f"  Train Loss: {train_loss:.4f} Acc: {train_acc:.4f}")
-        print(f"  Val   Loss: {val_loss:.4f} Acc: {val_acc:.4f}")
-        
-        if val_acc > best_acc:
-            best_acc = val_acc
-            torch.save(model.state_dict(), os.path.join(args.output_dir, "best_model.pt"))
-            print(f"  -> Saved Best Model (Acc: {best_acc:.4f})")
+        # Save Best
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "best_model.pt"))
+            print("   (Neues bestes Modell gespeichert)")
 
 if __name__ == "__main__":
-    import math
-    parser = argparse.ArgumentParser()
-    # Data
-    parser.add_argument("--data_path", type=str, default="data_chunks/labeled_data.jsonl")
-    parser.add_argument("--max_tokens", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=1) # Small batch for 10k tokens
-    # Model
-    parser.add_argument("--D", type=int, default=4)
-    parser.add_argument("--M", type=int, default=2)
-    parser.add_argument("--T_max", type=int, default=1)
-    parser.add_argument("--d_embed", type=int, default=4)
-    parser.add_argument("--num_heads", type=int, default=2)
-    parser.add_argument("--tokenizer", type=str, default="gpt2")
-    # Training
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--output_dir", type=str, default="checkpoints")
-    args = parser.parse_args()
-    main(args)
+    main()

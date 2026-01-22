@@ -1,92 +1,83 @@
 import torch
-from transformers import AutoTokenizer
+import os
+from sentence_transformers import SentenceTransformer
 from config import CTMConfig
-from model import ContinuousThoughtMachine
-from typing import List, Dict
+from ctm_model import ContinuousThoughtMachine
 
-def load_model(checkpoint_path="checkpoints/best_model.pt", device="cpu"):
-    print(f"Lade Modell von {checkpoint_path}...")
-    
-    # --- DIESE WERTE MÜSSEN DEM GELOSADETEN MODELL ENTSPRECHEN ---
-    config = CTMConfig(
-        D=4,               # War 512 -> Jetzt 4
-        M=2,               # War 15 -> Jetzt 2
-        T_max=20,
-        d_embed=4,         # War 512 -> Jetzt 4
-        num_heads=1,       # Muss Teiler von d_embed (4) sein
-        tokenizer_name="gpt2",
-        max_context_len=10000
-    )
-    
-    # Der Rest bleibt gleich...
-    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
-    vocab_size = tokenizer.vocab_size
-    
-    model = ContinuousThoughtMachine(config, vocab_size=vocab_size)
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-    model.to(device)
-    model.eval()
-    
-    return model, tokenizer
+# Pfade
+MODEL_PATH = "checkpoints/best_model.pt"
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
-def format_messages(messages: List[Dict]) -> str:
-    """
-    Converts the message list into the EXACT same format 
-    used during training.
-    """
-    return "\n".join([f"{msg['username']}: {msg['content']}" for msg in messages])
+def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Lade auf {device}...")
 
-def predict(messages: List[Dict], model, tokenizer, device="cpu"):
-    """
-    Args:
-        messages: List of dicts [{"username": "X", "content": "Y"}, ...]
-    """
-    # 1. Convert to string
-    text = format_messages(messages)
-    
-    # 2. Tokenize
-    inputs = tokenizer(
-        text, 
-        return_tensors="pt", 
-        truncation=True, 
-        max_length=model.config.max_context_len
-    )
-    
-    input_ids = inputs['input_ids'].to(device)
-    mask = inputs['attention_mask'].to(device)
-    
-    # 3. Run Model
-    with torch.no_grad():
-        output = model(input_ids, attention_mask=mask)
-        
-    prob = output['final_prediction'].item()
-    certainty = output['certainties']
-    ticks_used = certainty.argmax(1).item() + 1
-    
-    return prob, ticks_used
+    # 1. Lade Embedding Modell (für den Text -> Vektor Schritt)
+    print("Lade Encoder...")
+    encoder = SentenceTransformer(EMBEDDING_MODEL_NAME).to(device)
 
-# --- USAGE EXAMPLE ---
-if __name__ == "__main__":
-    # Load model once
-    model, tokenizer = load_model()
+    # 2. Lade CTM
+    print("Lade CTM...")
+    config = CTMConfig()
+    model = ContinuousThoughtMachine(config).to(device)
     
-    # THIS IS YOUR CONTEXT DATA
-    live_context = [
-        {"username": "RandomUser", "content": "Does this work?"},
-        {"username": "Admin", "content": "Sure does."},
-        {"username": "RandomUser", "content": "Okay cool."}
-    ]
-    
-    prob, ticks = predict(live_context, model, tokenizer)
-    
-    print("-" * 40)
-    print("Decision Threshold: 0.5")
-    print(f"Probability to Reply: {prob:.4f}")
-    
-    if prob > 0.5:
-        print(">> YES: The Bot should send an output.")
+    if os.path.exists(MODEL_PATH):
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+        model.eval()
+        print("Modell erfolgreich geladen!")
     else:
-        print(">> NO: The Bot should stay silent.")
+        print(f"FEHLER: Kein Modell unter {MODEL_PATH} gefunden. Erst trainieren!")
+        return
+
+    print("\n--- CTM Inference (Tippe 'exit' zum Beenden) ---")
+    print("Gib Chat-Nachrichten ein. Eine Nachricht pro Zeile.")
+    print("Tippe 'RUN' um die Vorhersage für den bisherigen Block zu starten.")
+    
+    current_context = []
+
+    while True:
+        user_input = input(">> ")
         
-    print(f"(Processing time: {ticks} ticks)")
-    print("-" * 40)
+        if user_input.lower() == 'exit':
+            break
+        
+        if user_input.strip() == "RUN":
+            if not current_context:
+                print("Kontext leer.")
+                continue
+                
+            # --- Inference Prozess ---
+            with torch.no_grad():
+                # A. Text zu Vektoren
+                embeddings = encoder.encode(current_context) # [Seq, 384]
+                emb_tensor = torch.tensor(embeddings, dtype=torch.float32).to(device).unsqueeze(0) # Batch Dim [1, Seq, 384]
+                
+                # B. CTM Denken lassen
+                out = model(emb_tensor)
+                
+                prob = out['probs'].item()
+                ticks = out['ticks_used'].item()
+                certainty = out['certainties'][0, ticks].item()
+                
+                print("-" * 30)
+                print(f"Kontext Länge: {len(current_context)} Nachrichten")
+                print(f"Wahrscheinlichkeit für Fortführung: {prob*100:.2f}%")
+                print(f"Sicherheit (Certainty): {certainty:.4f}")
+                print(f"Benötigte Denkzeit (Ticks): {ticks + 1} / {config.T_max}")
+                
+                if prob > 0.3:
+                    print("=> ENTSCHEIDUNG: ANTWORTEN (Flow geht weiter)")
+                else:
+                    print("=> ENTSCHEIDUNG: SCHWEIGEN (Flow bricht ab)")
+                print("-" * 30)
+            
+            # Reset für nächsten Test
+            current_context = []
+            print("Kontext zurückgesetzt. Neuer Input:")
+            
+        else:
+            # Einfach Nachricht zum Kontext hinzufügen
+            current_context.append(user_input)
+
+if __name__ == "__main__":
+    main()
