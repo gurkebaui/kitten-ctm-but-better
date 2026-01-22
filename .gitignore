@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets
+.env
+DISCORD_TOKEN
+
+# AI & Data
+checkpoints/
+*.pt
+data_chunks/
+*.jsonl
+
+# Logs & Rohe Daten
+*.log
+*.txt
